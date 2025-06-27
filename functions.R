@@ -124,46 +124,55 @@ compute_quantiles = function(ncdf_seasonality, varname = "sst", from = 0, to = 1
 }
 
 
-getPredFiles <- function(model_name, path, scenarios = c("rcp26", "rcp85"),
-                         model_id = "ipsl-cm5a-lr",
-                         hist_period = "195001_200512",
-                         future_period = "200601_210012") {
+getPredFiles <- function(model_name, path, 
+                         scenarios = c("rcp26", "rcp85"),
+                         model_id = "ipsl-cm5a-lr") {
   
-  # Historical file path
-  hist_file <- file.path(path, model_name, 
-                         paste0(model_id, "_historical_to_zs_monthly_", hist_period, ".nc4"))
+  model_dir <- file.path(path, model_name)
   
-  # Future scenario files paths
+  # Match historical file (any date range)
+  hist_pattern <- paste0("^", model_id, "_historical_to_zs_.*\\.nc4$")
+  hist_file <- list.files(model_dir, pattern = hist_pattern, full.names = TRUE)
+  hist_file <- if (length(hist_file) > 0) hist_file[1] else NULL
+  
+  # Match future scenario files (any date range)
   future_files <- sapply(scenarios, function(sc) {
-    file.path(path, model_name,
-              paste0(model_id, "_", sc, "_to_zs_humboldt-n_monthly_", future_period, ".nc4"))
+    pattern <- paste0("^", model_id, "_", sc, "_to_zs_.*\\.nc4$")
+    file <- list.files(model_dir, pattern = pattern, full.names = TRUE)
+    if (length(file) > 0) file[1] else NULL
   }, USE.NAMES = TRUE)
   
   return(list(historical = hist_file, future = future_files))
 }
 
+
 getPredData = function(model_name, path, quantileDir, 
                        scenarios = c("rcp26", "rcp85"),
-                       model_id = "ipsl-cm5a-lr",
-                       hist_period = "195001_200512",
-                       future_period = "200601_210012") {
+                       model_id = "ipsl-cm5a-lr") {
   
+  # Get paths to prediction files
   files = getPredFiles(model_name, path, 
                        scenarios = scenarios, 
-                       model_id = model_id, 
-                       hist_period = hist_period, 
-                       future_period = future_period)
+                       model_id = model_id)
+  
+  # Sanity check
+  if (is.null(files$historical) || !file.exists(files$historical)) {
+    stop("Missing historical file for model: ", model_name)
+  }
+  if (any(sapply(files$future, is.null) | !file.exists(unlist(files$future)))) {
+    stop("Missing one or more future scenario files for model: ", model_name)
+  }
   
   output = list()
   
-  # Load historical
+  # Load historical NetCDF
   nc = nc_open(files$historical)
   output$lon = ncvar_get(nc, "lon")
   output$lat = ncvar_get(nc, "lat")
   output$historical = ncvar_get(nc)
   nc_close(nc)
   
-  # Load future (as list of arrays by scenario)
+  # Load future NetCDFs (returns list named by scenario)
   output$future = lapply(files$future, function(futfile) {
     nc = nc_open(futfile)
     val = ncvar_get(nc)
@@ -171,24 +180,17 @@ getPredData = function(model_name, path, quantileDir,
     return(val)
   })
   
-  # Load quantile data from .rds file
+  # Load quantile .rds
   qfile = file.path(quantileDir, paste0(model_name, ".rds"))
   if (!file.exists(qfile)) {
     stop("Quantile file not found: ", qfile)
   }
   
   quant_table = readRDS(qfile)
+  output$quantile = if ("quantile" %in% names(quant_table)) quant_table$quantile else quant_table
+  dimnames(output$quantile) = NULL  # remove dimnames for consistency
   
-  # Try to extract just the quantile matrix/vector
-  if ("quantile" %in% names(quant_table)) {
-    output$quantile = quant_table$quantile
-  } else {
-    output$quantile = quant_table  # fallback if it's already just the array
-  }
-  
-  dimnames(output$quantile) = NULL
-  
-  # Optional: addExtremes if needed
+  # Add extremes (min/max)
   output = addExtremes(output)
   
   return(output)
@@ -209,8 +211,7 @@ compute_quantiles2 <- function(all_dwsc, probs = seq(0, 1, by=0.05)) {
   return(quant_merged)
 }
 
-
-addExtremes = function(output, probs=c(0.05, 0.95)) {
+addExtremes1 = function(output, probs=c(0.05, 0.95)) {
   
   probs = unique(round(probs, 2))
   # min
@@ -240,11 +241,145 @@ addExtremes = function(output, probs=c(0.05, 0.95)) {
     }
     
   }
+  
   class(output) = c("downscaling.results", class(output))
   
   return(output)
 }
 
+addExtremes2 = function(output, probs=c(0.05, 0.95)) {
+  
+  probs = unique(round(probs, 2))
+  
+  # Helper function to compute min/mean/max/quantile if possible
+  compute_stat <- function(x, FUN) {
+    if(is.null(x)) return(NULL)
+    dims <- length(dim(x))
+    if (dims < 3) {
+      # If only 2D, just return the matrix (no time dimension to aggregate)
+      return(x)
+    } else {
+      # Aggregate over time or third dimension
+      return(apply(x, 1:2, FUN, na.rm=TRUE))
+    }
+  }
+  
+  # Min
+  output$min = list()
+  output$min$historical = compute_stat(output$historical, min)
+  output$min$future     = compute_stat(output$future, min)
+  output$min$range = suppressWarnings(range(pretty(unlist(output$min))))
+  
+  # Mean
+  output$mean = list()
+  output$mean$historical = compute_stat(output$historical, mean)
+  output$mean$future     = compute_stat(output$future, mean)
+  output$mean$range = suppressWarnings(range(pretty(unlist(output$mean))))
+  
+  # Max
+  output$max = list()
+  output$max$historical = compute_stat(output$historical, max)
+  output$max$future     = compute_stat(output$future, max)
+  output$max$range = suppressWarnings(range(pretty(unlist(output$max))))
+  
+  if(!is.null(probs)) {
+    for(i in probs) {
+      iName = sprintf("p%02.0f", 100*i)
+      output[[iName]] = list()
+      output[[iName]]$historical = if(!is.null(output$historical)) {
+        dims <- length(dim(output$historical))
+        if (dims < 3) {
+          output$historical  # No quantiles if no time dim
+        } else {
+          apply(output$historical, 1:2, quantile, probs=i, na.rm=TRUE)
+        }
+      } else NULL
+      
+      output[[iName]]$future = if(!is.null(output$future)) {
+        dims <- length(dim(output$future))
+        if (dims < 3) {
+          output$future
+        } else {
+          apply(output$future, 1:2, quantile, probs=i, na.rm=TRUE)
+        }
+      } else NULL
+      
+      output[[iName]]$range = suppressWarnings(range(pretty(unlist(output[[iName]]))))
+    }
+  }
+  
+  class(output) = c("downscaling.results", class(output))
+  return(output)
+}
+
+
+addExtremes <- function(output, probs = c(0.05, 0.95)) {
+  
+  probs <- unique(round(probs, 2))
+  
+  # Helper function to compute stat if array is 3D, else return as-is
+  compute_stat <- function(x, FUN) {
+    if (is.null(x)) return(NULL)
+    dims <- length(dim(x))
+    if (dims < 3) {
+      return(x)  # no aggregation if 2D
+    } else {
+      return(apply(x, 1:2, FUN, na.rm = TRUE))
+    }
+  }
+  
+  # Min
+  output$min <- list(
+    historical = compute_stat(output$historical, min),
+    future = compute_stat(output$future, min)
+  )
+  output$min$range <- suppressWarnings(range(pretty(unlist(output$min))))
+  
+  # Mean
+  output$mean <- list(
+    historical = compute_stat(output$historical, mean),
+    future = compute_stat(output$future, mean)
+  )
+  output$mean$range <- suppressWarnings(range(pretty(unlist(output$mean))))
+  
+  # Max
+  output$max <- list(
+    historical = compute_stat(output$historical, max),
+    future = compute_stat(output$future, max)
+  )
+  output$max$range <- suppressWarnings(range(pretty(unlist(output$max))))
+  
+  # Quantiles
+  if (!is.null(probs)) {
+    for (i in probs) {
+      iName <- sprintf("p%02.0f", 100 * i)
+      output[[iName]] <- list()
+      
+      output[[iName]]$historical <- if (!is.null(output$historical)) {
+        dims <- length(dim(output$historical))
+        if (dims < 3) {
+          output$historical  # keep as-is
+        } else {
+          apply(output$historical, 1:2, quantile, probs = i, na.rm = TRUE)
+        }
+      } else NULL
+      
+      output[[iName]]$future <- if (!is.null(output$future)) {
+        dims <- length(dim(output$future))
+        if (dims < 3) {
+          output$future
+        } else {
+          apply(output$future, 1:2, quantile, probs = i, na.rm = TRUE)
+        }
+      } else NULL
+      
+      output[[iName]]$range <- suppressWarnings(range(pretty(unlist(output[[iName]]))))
+    }
+  }
+  
+  class(output) <- c("downscaling.results", class(output))
+  return(output)
+}
 
 
 # Function to assign indicator names
@@ -263,22 +398,53 @@ get_indicator_names <- function() {
   return(names)
 }
 
-
-add_aux_vars = function(data, shelf_data, bathy_data, 
-                        lon_var_data = "lon", lat_var_data = "lat",
-                        lon_var_cov = "longitude", lat_var_cov = "latitude",
+add_aux_vars = function(data, shelf_data, bathy_data,
                         shelf_value = "shelf", bathy_value = "depth") {
   
-  data_coords = unique(data[c(lon_var_data, lat_var_data)])
-  shelf_data  = merge(data_coords, shelf_data, by.x = c(lon_var_data, lat_var_data), by.y = c(lon_var_cov, lat_var_cov), all.x = TRUE)
-  bathy_data  = merge(data_coords, bathy_data, by.x = c(lon_var_data, lat_var_data), by.y = c(lon_var_cov, lat_var_cov), all.x = TRUE)
+  # --- Detect lon/lat column names in `data`
+  if ("lon" %in% names(data) && "lat" %in% names(data)) {
+    lon_data = "lon"
+    lat_data = "lat"
+  } else if ("longitude" %in% names(data) && "latitude" %in% names(data)) {
+    lon_data = "longitude"
+    lat_data = "latitude"
+  } else {
+    stop("Longitude/latitude columns not found in data.")
+  }
   
+  # --- Detect lon/lat column names in shelf/bathy data
+  if ("lon" %in% names(shelf_data) && "lat" %in% names(shelf_data)) {
+    lon_cov = "lon"
+    lat_cov = "lat"
+  } else if ("longitude" %in% names(shelf_data) && "latitude" %in% names(shelf_data)) {
+    lon_cov = "longitude"
+    lat_cov = "latitude"
+  } else {
+    stop("Longitude/latitude columns not found in covariate data.")
+  }
+  
+  # --- Get unique coordinates
+  data_coords = unique(data[c(lon_data, lat_data)])
+  
+  # --- Merge shelf and bathy
+  shelf_data = merge(data_coords, shelf_data, 
+                     by.x = c(lon_data, lat_data), 
+                     by.y = c(lon_cov, lat_cov), 
+                     all.x = TRUE)
+  
+  bathy_data = merge(data_coords, bathy_data, 
+                     by.x = c(lon_data, lat_data), 
+                     by.y = c(lon_cov, lat_cov), 
+                     all.x = TRUE)
+  
+  # --- Repeat for matching full data size
   reps = nrow(data) / nrow(data_coords)
   if (!isTRUE(all.equal(reps, round(reps)))) stop("Mismatch between data and coordinates.")
   
   shelf_repeated = shelf_data[[shelf_value]][rep(1:nrow(shelf_data), each = reps)]
   bathy_repeated = bathy_data[[bathy_value]][rep(1:nrow(bathy_data), each = reps)]
   
+  # --- Define slog and compute new variables
   slog = function(x) sign(x) * log(abs(x))
   
   data$shelf  = shelf_repeated
@@ -318,3 +484,58 @@ fix_melted_names <- function(df, value_name = "value") {
   df
 }
 
+
+getPredDat <- function(model, rcp, inputDir = "outputs/downscaling", quantile_path = NULL,ext_fun = addextremes1) {
+  model_path <- file.path(inputDir, model)
+  cat("==> Processing model:", model, "with RCP:", rcp, "\n")
+  cat("Looking in directory:", model_path, "\n")
+  
+  # Get .nc files
+  all_files <- list.files(model_path, full.names = TRUE)
+  hist_file <- all_files[grepl("historical", all_files) & grepl("\\.nc", all_files)]
+  future_file <- all_files[grepl(rcp, all_files) & grepl("\\.nc", all_files)]
+  
+  if (length(hist_file) != 1) stop(paste("Problem with historical file for", model))
+  if (length(future_file) != 1) stop(paste("Problem with future file for", model, rcp))
+  
+  histo <- read_gts(hist_file)
+  future <- read_gts(future_file)
+  
+  # Load and extract quantiles
+  if (is.null(quantile_path)) stop("Must provide quantile_path to load .rds file")
+  quant_obj <- readRDS(quantile_path)
+  
+  if (!"sst_historical" %in% names(quant_obj)) stop("Quantile object lacks 'sst_historical'")
+  
+  quant_hist <- quant_obj[["sst_historical"]]
+  
+  # Build final list
+  X <- list(
+    lon = histo$lon,
+    lat = histo$lat,
+    historical = histo$x,
+    future = future$x,
+    quantile = quant_hist
+  )
+  
+  #Verification
+  cat("==> Inspecting data for model:", model, "\n")
+  cat("Dimensions:\n")
+  print("  historical:"); print(dim(histo$x))
+  print("  future:"); print(dim(future$x))
+  print("  quantile:"); print(dim(quant_hist))
+  
+  cat("Summary:\n")
+  print(summary(histo$x))
+  print(summary(future$x))
+  print(summary(quant_hist))
+  
+  # Optional: check for NAs
+  cat("NA counts:\n")
+  cat("  historical:", sum(is.na(histo$x)), "\n")
+  cat("  future:", sum(is.na(future$x)), "\n")
+  cat("  quantile:", sum(is.na(quant_hist)), "\n")
+  
+  X <- ext_fun(X)  # Optional depending on your needs
+  return(X)
+}
